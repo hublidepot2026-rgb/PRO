@@ -1,0 +1,187 @@
+/***********************
+ * CONFIG
+ ***********************/
+const SHEET_NAME   = 'ICF_Coaches_Running_Trains';
+const CALENDAR_NAME = 'ICF_Due_Alerts';
+const POPUP_DAYS    = 10;
+
+/***********************
+ * MENU
+ ***********************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('ICF Controls')
+    .addItem('Run Daily Check', 'runDailyCheck')
+    .addItem('Sync Calendar (Events + Popups)', 'syncCalendar')
+    .addToUi();
+}
+
+/***********************
+ * DATE HELPERS
+ ***********************/
+function stripTime(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function addMonths(date, months) {
+  const d = new Date(date);
+  const day = d.getDate();
+  d.setMonth(d.getMonth() + months);
+  if (d.getDate() < day) d.setDate(0);
+  return stripTime(d);
+}
+
+function daysBetween(a, b) {
+  return Math.floor((stripTime(b) - stripTime(a)) / (1000 * 60 * 60 * 24));
+}
+
+/***********************
+ * CALENDAR HELPER
+ ***********************/
+function getOrCreateCalendar() {
+  const cals = CalendarApp.getCalendarsByName(CALENDAR_NAME);
+  return cals.length ? cals[0] : CalendarApp.createCalendar(CALENDAR_NAME);
+}
+
+/***********************
+ * DAILY RUN CHECK (SHEET COLOURS)
+ ***********************/
+function runDailyCheck() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const range = sheet.getRange(2, 1, lastRow - 1, 7);
+  const data = range.getValues();
+  const today = stripTime(new Date());
+
+  // Clear old colours
+  range.setBackground(null);
+
+  const backgrounds = [];
+
+  data.forEach(row => {
+    const pohDate    = row[4] instanceof Date ? stripTime(row[4]) : null;
+    const iohDone    = row[5] instanceof Date ? stripTime(row[5]) : null;
+    const returnDate = row[6] instanceof Date ? stripTime(row[6]) : null;
+
+    let iohDue = null;
+    let pohDue = null;
+
+    // IOH due = POH + 9 months (only if IOH not done)
+    if (pohDate && !iohDone) {
+      iohDue = addMonths(pohDate, 9);
+    }
+
+    // POH due logic
+    if (iohDone) {
+      pohDue = addMonths(iohDone, 9);
+    } else if (pohDate) {
+      pohDue = addMonths(pohDate, 18);
+    }
+
+    // Return date overrides POH
+    if (returnDate) {
+      pohDue = returnDate;
+    }
+
+    // Decide colour based on nearest due
+    let minDays = null;
+    [iohDue, pohDue].forEach(d => {
+      if (!d) return;
+      const days = daysBetween(today, d);
+      if (minDays === null || days < minDays) minDays = days;
+    });
+
+    let color = '#ffffff';
+    if (minDays !== null) {
+      if (minDays <= 0) color = '#c62828';        // Red
+      else if (minDays <= 7) color = '#ef6c00';   // Orange
+      else if (minDays <= 30) color = '#f9a825';  // Yellow
+    }
+
+    backgrounds.push(new Array(row.length).fill(color));
+  });
+
+  range.setBackgrounds(backgrounds);
+}
+
+/***********************
+ * CREATE EVENT + POPUPS
+ ***********************/
+function createEventWithPopups(calendar, title, dueDate, description) {
+
+  const start = new Date(dueDate);
+  start.setHours(9, 0, 0, 0); // 9 AM IST
+
+  const end = new Date(start.getTime() + 15 * 60 * 1000); // +15 min
+
+  // Prevent duplicates
+  const existing = calendar.getEvents(start, end, { search: title });
+  if (existing.length > 0) return;
+
+  // Build popup reminders (10 → 0 days)
+  const reminders = [];
+  for (let d = POPUP_DAYS; d >= 0; d--) {
+    reminders.push({
+      method: 'popup',
+      minutes: d * 24 * 60
+    });
+  }
+
+  calendar.createEvent(title, start, end, {
+    description: description,
+    reminders: {
+      useDefault: false,
+      overrides: reminders
+    }
+  });
+}
+
+/***********************
+ * SYNC CALENDAR
+ ***********************/
+function syncCalendar() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).getValues();
+  const calendar = getOrCreateCalendar();
+
+  data.forEach(row => {
+    const train     = row[1];
+    const coach     = row[2];
+    const pohDate   = row[4] instanceof Date ? stripTime(row[4]) : null;
+    const iohDone   = row[5] instanceof Date ? stripTime(row[5]) : null;
+    const returnDate= row[6] instanceof Date ? stripTime(row[6]) : null;
+
+    if (!coach || !pohDate) return;
+
+    // IOH due
+    if (!iohDone) {
+      const iohDue = addMonths(pohDate, 9);
+      createEventWithPopups(
+        calendar,
+        `${coach} IOH`,
+        iohDue,
+        `Train: ${train}\nCoach: ${coach}\nType: IOH`
+      );
+    }
+
+    // POH due
+    let pohDue = null;
+    if (iohDone) pohDue = addMonths(iohDone, 9);
+    else pohDue = addMonths(pohDate, 18);
+
+    if (returnDate) pohDue = returnDate;
+
+    createEventWithPopups(
+      calendar,
+      `${coach} POH`,
+      pohDue,
+      `Train: ${train}\nCoach: ${coach}\nType: POH`
+    );
+  });
+}
