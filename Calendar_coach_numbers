@@ -1,0 +1,160 @@
+/***********************
+ * CONFIG
+ ***********************/
+const SHEET_NAME = 'ICF_Coaches_Running_Trains';
+const CALENDAR_NAME = 'ICF_Due_Alerts';
+const POPUP_DAYS = 10;
+
+/***********************
+ * MENU
+ ***********************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('ICF Controls')
+    .addItem('Run Daily Check', 'runDailyCheck')
+    .addItem('Sync Calendar (Events + Popups)', 'syncCalendar')
+    .addToUi();
+}
+
+/***********************
+ * DATE HELPERS
+ ***********************/
+function stripTime(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function addMonths(d, m) {
+  const x = new Date(d);
+  x.setMonth(x.getMonth() + m);
+  return stripTime(x);
+}
+
+function daysBetween(a, b) {
+  return Math.floor((stripTime(b) - stripTime(a)) / (1000 * 60 * 60 * 24));
+}
+
+/***********************
+ * CALENDAR HELPER
+ ***********************/
+function getOrCreateCalendar() {
+  const cals = CalendarApp.getCalendarsByName(CALENDAR_NAME);
+  return cals.length ? cals[0] : CalendarApp.createCalendar(CALENDAR_NAME);
+}
+
+/***********************
+ * DAILY RUN CHECK (SHEET COLOURS)
+ ***********************/
+function runDailyCheck() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).getValues();
+  const today = stripTime(new Date());
+
+  // clear old colours
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).setBackground(null);
+
+  data.forEach((row, i) => {
+    const poh = row[4];
+    const ret = row[6];
+    if (!(poh instanceof Date)) return;
+
+    const iohDue = addMonths(poh, 9);
+    let pohDue = addMonths(poh, 18);
+    if (ret instanceof Date) pohDue = stripTime(ret);
+
+    const iohDiff = daysBetween(today, iohDue);
+    const pohDiff = daysBetween(today, pohDue);
+
+    let color = null;
+    if (iohDiff <= 0 || pohDiff <= 0) color = '#c62828';       // red
+    else if (iohDiff <= 7 || pohDiff <= 7) color = '#ef6c00'; // orange
+    else if (iohDiff <= 30 || pohDiff <= 30) color = '#f9a825'; // yellow
+
+    if (color) {
+      sheet.getRange(i + 2, 1, 1, 7).setBackground(color);
+    }
+  });
+}
+
+/***********************
+ * CREATE EVENT + POPUPS
+ ***********************/
+function createEventWithPopups(calendar, title, dueDate, description) {
+
+  const start = new Date(dueDate);
+  start.setHours(9, 0, 0, 0); // 9 AM IST
+
+  const end = new Date(start);
+  end.setMinutes(15);
+
+  // prevent duplicates
+  const existing = calendar.getEvents(start, end, { search: title });
+  if (existing.length > 0) return;
+
+  const reminders = [];
+  for (let d = POPUP_DAYS; d >= 0; d--) {
+    reminders.push({
+      method: 'popup',
+      minutes: d * 24 * 60
+    });
+  }
+
+}
+function testPopupNow() {
+  const cal = CalendarApp.getCalendarByName("ICF_Due_Alerts");
+
+  const start = new Date();
+  start.setMinutes(start.getMinutes() + 10); // event 10 mins later
+
+  const end = new Date(start);
+  end.setMinutes(end.getMinutes() + 5);
+
+  const event = cal.createEvent(
+    "TEST POPUP – Ignore",
+    start,
+    end
+  );
+
+  event.addPopupReminder(5); // popup in 5 minutes
+}
+
+/***********************
+ * SYNC CALENDAR
+ ***********************/
+function syncCalendar() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).getValues();
+  const calendar = getOrCreateCalendar();
+
+  data.forEach(row => {
+    const train = row[1];
+    const coach = row[2];
+    const poh = row[4];
+    const ret = row[6];
+
+    if (!coach || !(poh instanceof Date)) return;
+
+    // IOH due
+    const iohDue = addMonths(poh, 9);
+    createEventWithPopups(
+      calendar,
+      `${coach} IOH`,
+      iohDue,
+      `Train: ${train}\nCoach: ${coach}\nType: IOH`
+    );
+
+    // POH due
+    let pohDue = addMonths(poh, 18);
+    if (ret instanceof Date) pohDue = stripTime(ret);
+
+    createEventWithPopups(
+      calendar,
+      `${coach} POH`,
+      pohDue,
+      `Train: ${train}\nCoach: ${coach}\nType: POH`
+    );
+  });
+}
