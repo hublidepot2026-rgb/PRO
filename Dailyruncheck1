@@ -1,0 +1,99 @@
+/************ CONFIG ************/
+const SHEET_NAME = 'ICF_Coaches_Running_Trains';
+
+// Column indexes (0-based)
+const COL_POH = 4;
+const COL_IOH = 5;
+const COL_RETURN = 6;
+
+/************ MENU ************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('ICF Controls')
+    .addItem('Run Daily Check Now', 'runDailyCheck')
+    .addToUi();
+}
+
+/************ MAIN DAILY CHECK ************/
+function runDailyCheck() {
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Sheet not found: ' + SHEET_NAME);
+    return;
+  }
+
+  const today = stripTime(new Date());
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const range = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn());
+  const values = range.getValues();
+  const backgrounds = [];
+
+  values.forEach(row => {
+
+    const pohDate = row[COL_POH] ? stripTime(new Date(row[COL_POH])) : null;
+    const iohDate = row[COL_IOH] ? stripTime(new Date(row[COL_IOH])) : null;
+    const returnDate = row[COL_RETURN] ? stripTime(new Date(row[COL_RETURN])) : null;
+
+    let iohDue = null;
+    let pohDue = null;
+
+    // 1️⃣ IOH due = POH + 9 months (ONLY if IOH not yet done)
+    if (pohDate && !iohDate) {
+      iohDue = addMonths(pohDate, 9);
+    }
+
+    // 2️⃣ POH due logic
+    if (iohDate) {
+      // IOH already done → next POH due
+      pohDue = addMonths(iohDate, 9);
+    } else if (pohDate) {
+      // No IOH → POH due from POH itself
+      pohDue = addMonths(pohDate, 18);
+    }
+
+    // 3️⃣ Return date overrides POH
+    if (returnDate) {
+      pohDue = returnDate;
+    }
+
+    // 4️⃣ Decide color
+    let color = '#ffffff'; // default
+
+    const checkDates = [];
+    if (iohDue) checkDates.push(iohDue);
+    if (pohDue) checkDates.push(pohDue);
+
+    let minDays = null;
+
+    checkDates.forEach(d => {
+      const days = Math.floor((d - today) / (1000 * 60 * 60 * 24));
+      if (minDays === null || days < minDays) minDays = days;
+    });
+
+    if (minDays !== null) {
+      if (minDays <= 0) color = '#c62828';        // 🔴 Red
+      else if (minDays <= 7) color = '#ef6c00';   // 🟠 Orange
+      else if (minDays <= 30) color = '#f9a825';  // 🟡 Yellow
+    }
+
+    backgrounds.push(new Array(row.length).fill(color));
+  });
+
+  range.setBackgrounds(backgrounds);
+}
+
+/************ HELPERS ************/
+function stripTime(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function addMonths(date, months) {
+  const d = new Date(date);
+  const day = d.getDate();
+  d.setMonth(d.getMonth() + months);
+  if (d.getDate() < day) d.setDate(0);
+  return d;
+}
