@@ -1,0 +1,216 @@
+/************************************
+ * CONFIG
+ ************************************/
+const SHEET_NAME    = 'ICF_Coaches_Running_Trains';
+const CALENDAR_NAME = 'ICF_Due_Alerts';
+
+// Column indexes (0-based)
+const COL_TRAIN  = 1;
+const COL_COACH  = 2;
+const COL_POH    = 4;
+const COL_IOH    = 5;
+const COL_RETURN = 6;
+
+/************************************
+ * MENU
+ ************************************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('ICF Controls')
+    .addItem('Run Daily Check (Sheet Colours)', 'runDailyCheck')
+    .addItem('Sync Calendar (10-Day Countdown)', 'syncCalendarCountdown')
+    .addToUi();
+}
+
+/************************************
+ * DATE HELPERS
+ ************************************/
+function stripTime(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function addMonths(date, months) {
+  const d = new Date(date);
+  const day = d.getDate();
+  d.setMonth(d.getMonth() + months);
+  if (d.getDate() < day) d.setDate(0);
+  return stripTime(d);
+}
+
+function daysBetween(a, b) {
+  return Math.floor((stripTime(b) - stripTime(a)) / (1000 * 60 * 60 * 24));
+}
+
+/************************************
+ * CALENDAR HELPER
+ ************************************/
+function getOrCreateCalendar() {
+  const cals = CalendarApp.getCalendarsByName(CALENDAR_NAME);
+  return cals.length ? cals[0] : CalendarApp.createCalendar(CALENDAR_NAME);
+}
+
+/************************************
+ * DAILY RUN CHECK (SHEET COLOURS)
+ ************************************/
+function runDailyCheck() {
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Sheet not found: ' + SHEET_NAME);
+    return;
+  }
+
+  const today = stripTime(new Date());
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const range = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn());
+  const values = range.getValues();
+  const backgrounds = [];
+
+  values.forEach(row => {
+
+    const pohDate    = row[COL_POH]    instanceof Date ? stripTime(row[COL_POH])    : null;
+    const iohDone    = row[COL_IOH]    instanceof Date ? stripTime(row[COL_IOH])    : null;
+    const returnDate = row[COL_RETURN] instanceof Date ? stripTime(row[COL_RETURN]) : null;
+
+    let iohDue = null;
+    let pohDue = null;
+
+    // IOH due = POH + 9 months (only if IOH not done)
+    if (pohDate && !iohDone) {
+      iohDue = addMonths(pohDate, 9);
+    }
+
+    // POH due logic
+    if (iohDone) {
+      pohDue = addMonths(iohDone, 9);
+    } else if (pohDate) {
+      pohDue = addMonths(pohDate, 18);
+    }
+
+    // Return date overrides POH
+    if (returnDate) {
+      pohDue = returnDate;
+    }
+
+    // Decide colour based on nearest due
+    let minDays = null;
+    [iohDue, pohDue].forEach(d => {
+      if (!d) return;
+      const days = daysBetween(today, d);
+      if (minDays === null || days < minDays) minDays = days;
+    });
+
+    let color = '#ffffff';
+    if (minDays !== null) {
+      if (minDays <= 0)      color = '#c62828'; // 🔴 Red
+      else if (minDays <= 7) color = '#ef6c00'; // 🟠 Orange
+      else if (minDays <= 30)color = '#f9a825'; // 🟡 Yellow
+    }
+
+    backgrounds.push(new Array(row.length).fill(color));
+  });
+
+  range.setBackgrounds(backgrounds);
+}
+
+/************************************
+ * CALENDAR COUNTDOWN EVENT CREATOR
+ ************************************/
+function createCountdownEvent(calendar, title, date, description, color) {
+
+  const start = new Date(date);
+  start.setHours(9, 0, 0, 0); // 9 AM IST
+
+  const end = new Date(start.getTime() + 15 * 60 * 1000);
+
+  // Prevent duplicates
+  const existing = calendar.getEvents(start, end, { search: title });
+  if (existing.length > 0) return;
+
+  const event = calendar.createEvent(title, start, end, {
+    description: description
+  });
+
+  // Colour coding
+  if (color === 'RED') {
+    event.setColor(CalendarApp.EventColor.RED);
+  } else if (color === 'ORANGE') {
+    event.setColor(CalendarApp.EventColor.ORANGE);
+  }
+}
+
+/************************************
+ * SYNC CALENDAR – 10-DAY COUNTDOWN
+ ************************************/
+function syncCalendarCountdown() {
+
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const calendar = getOrCreateCalendar();
+  const today = stripTime(new Date());
+
+  data.forEach(row => {
+
+    const train      = row[COL_TRAIN];
+    const coach      = row[COL_COACH];
+    const pohDate    = row[COL_POH]    instanceof Date ? stripTime(row[COL_POH])    : null;
+    const iohDone    = row[COL_IOH]    instanceof Date ? stripTime(row[COL_IOH])    : null;
+    const returnDate = row[COL_RETURN] instanceof Date ? stripTime(row[COL_RETURN]) : null;
+
+    if (!coach || !pohDate) return;
+
+    /* ---------- IOH DUE ---------- */
+    if (!iohDone) {
+      const iohDue = addMonths(pohDate, 9);
+
+      for (let d = 9; d >= 0; d--) {
+        const eventDate = new Date(iohDue);
+        eventDate.setDate(eventDate.getDate() - d);
+        if (eventDate < today) continue;
+
+        const title =
+          d === 0
+            ? `${coach} IOH DUE TODAY`
+            : `${coach} IOH due in ${d} days`;
+
+        createCountdownEvent(
+          calendar,
+          title,
+          eventDate,
+          `Train: ${train}\nCoach: ${coach}\nType: IOH`,
+          d === 0 ? 'RED' : 'ORANGE'
+        );
+      }
+    }
+
+    /* ---------- POH DUE ---------- */
+    let pohDue;
+    if (iohDone) pohDue = addMonths(iohDone, 9);
+    else pohDue = addMonths(pohDate, 18);
+
+    if (returnDate) pohDue = returnDate;
+
+    for (let d = 9; d >= 0; d--) {
+      const eventDate = new Date(pohDue);
+      eventDate.setDate(eventDate.getDate() - d);
+      if (eventDate < today) continue;
+
+      const title =
+        d === 0
+          ? `${coach} POH DUE TODAY`
+          : `${coach} POH due in ${d} days`;
+
+      createCountdownEvent(
+        calendar,
+        title,
+        eventDate,
+        `Train: ${train}\nCoach: ${coach}\nType: POH`,
+        d === 0 ? 'RED' : 'ORANGE'
+      );
+    }
+  });
+}
