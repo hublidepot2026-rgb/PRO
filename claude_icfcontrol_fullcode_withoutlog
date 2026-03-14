@@ -1,0 +1,410 @@
+/************************************
+ * CONFIG  —  edit only this section
+ ************************************/
+const SHEET_NAME    = 'ICF_PRO_UBL_2026';
+const CALENDAR_NAME = 'ICF_Due_Alerts';
+const LOG_SHEET_URL = '';  // ← paste your Change Log Google Sheet URL here
+const BATCH_SIZE    = 15;  // 15 coaches per batch — safe for rate limit
+
+// Srl | Train No | Coach Number | Coach Type | POH Date | IOH Date | Return Date
+//  0       1            2             3           4          5           6
+const COL_TRAIN  = 1;
+const COL_COACH  = 2;
+const COL_TYPE   = 3;
+const COL_POH    = 4;
+const COL_IOH    = 5;
+const COL_RETURN = 6;
+
+const REMINDER_START_DAYS = 10;
+const COL_HEADERS = ['Srl','Train No','Coach Number','Coach Type','POH Date','IOH Date','Return Date'];
+
+/************************************
+ * MENU
+ ************************************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('CDO_UBL ICF Controls')
+    .addItem('▶ Run Daily Colour Check', 'runDailyCheck')
+    .addSeparator()
+    .addItem('📅 Start Calendar Sync (Step 1)', 'startCalendarSync')
+    .addItem('📅 Continue Calendar Sync', 'continueCalendarSync')
+    .addItem('📅 Full Sync Status', 'checkSyncStatus')
+    .addSeparator()
+    .addItem('⚙ Setup Auto Daily Trigger', 'setupTrigger')
+    .addItem('⚙ Setup Change Tracking', 'setupOnEditTrigger')
+    .addItem('🗑 Remove Auto Trigger', 'removeTrigger')
+    .addToUi();
+}
+
+/************************************
+ * DATE HELPERS
+ ************************************/
+function stripTime(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function addMonths(date, months) {
+  const d = new Date(date);
+  const day = d.getDate();
+  d.setMonth(d.getMonth() + months);
+  if (d.getDate() < day) d.setDate(0);
+  return stripTime(d);
+}
+
+function daysBetween(a, b) {
+  return Math.floor((stripTime(b) - stripTime(a)) / (1000 * 60 * 60 * 24));
+}
+
+function fmtDate(d) {
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM/yyyy');
+}
+
+function fmtDateTime(d) {
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm:ss');
+}
+
+function sleep(ms) {
+  Utilities.sleep(ms);
+}
+
+/************************************
+ * CALENDAR HELPER
+ ************************************/
+function getOrCreateCalendar() {
+  const cals = CalendarApp.getCalendarsByName(CALENDAR_NAME);
+  return cals.length ? cals[0] : CalendarApp.createCalendar(CALENDAR_NAME);
+}
+
+/************************************
+ * COMPUTE DUE DATE FOR A ROW
+ * — IOH Date empty  → due for IOH = POH Date + 9 months
+ * — IOH Date filled → due for POH = IOH Date + 9 months
+ * — Return Date filled → overrides POH due date
+ ************************************/
+function getDueDate(row) {
+  const pohDate    = row[COL_POH]    instanceof Date ? stripTime(row[COL_POH])    : null;
+  const iohDone    = row[COL_IOH]    instanceof Date ? stripTime(row[COL_IOH])    : null;
+  const returnDate = row[COL_RETURN] instanceof Date ? stripTime(row[COL_RETURN]) : null;
+
+  if (!pohDate) return null;
+
+  if (!iohDone) {
+    return { dueDate: addMonths(pohDate, 9), dueType: 'IOH' };
+  } else {
+    return { dueDate: returnDate ? returnDate : addMonths(iohDone, 9), dueType: 'POH' };
+  }
+}
+
+/************************************
+ * DAILY COLOUR CHECK
+ ************************************/
+function runDailyCheck() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) { SpreadsheetApp.getUi().alert('Sheet not found: ' + SHEET_NAME); return; }
+
+  const today   = stripTime(new Date());
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const numCols = sheet.getLastColumn();
+  const range   = sheet.getRange(2, 1, lastRow - 1, numCols);
+  const values  = range.getValues();
+  const backgrounds = [];
+
+  values.forEach(row => {
+    const result = getDueDate(row);
+    let color = '#ffffff';
+    if (result) {
+      const days = daysBetween(today, result.dueDate);
+      if      (days <= 0)  color = '#c62828';
+      else if (days <= 7)  color = '#ef6c00';
+      else if (days <= 30) color = '#FFD600';
+    }
+    backgrounds.push(new Array(numCols).fill(color));
+  });
+
+  range.setBackgrounds(backgrounds);
+}
+
+/************************************
+ * CREATE EVENTS FOR ONE COACH
+ ************************************/
+function createEventsForCoach(calendar, train, coach, type, dueDate, dueType, today) {
+  let created = 0;
+  for (let d = REMINDER_START_DAYS; d >= 0; d--) {
+    const eventDate = new Date(dueDate);
+    eventDate.setDate(eventDate.getDate() - d);
+    if (eventDate < today) continue;
+
+    const title = d === 0
+      ? '🔴 ' + coach + ' ' + dueType + ' DUE TODAY'
+      : coach + ' ' + dueType + ' due in ' + d + ' day' + (d > 1 ? 's' : '');
+
+    const desc =
+      'Train No     : ' + train + '\n' +
+      'Coach Number : ' + coach + '\n' +
+      'Coach Type   : ' + type  + '\n' +
+      dueType + ' Due      : ' + fmtDate(dueDate) + '\n' +
+      'Days Left    : ' + d;
+
+    const start = new Date(eventDate);
+    start.setHours(9, 0, 0, 0);
+    const end = new Date(start.getTime() + 15 * 60 * 1000);
+
+    try {
+      const event = calendar.createEvent(title, start, end, { description: desc });
+      event.setColor(d === 0 ? CalendarApp.EventColor.RED : CalendarApp.EventColor.ORANGE);
+      created++;
+      sleep(200); // 200ms between each event
+    } catch(err) {
+      sleep(2000); // wait 2s and retry once if rate limited
+      try {
+        const event = calendar.createEvent(title, start, end, { description: desc });
+        event.setColor(d === 0 ? CalendarApp.EventColor.RED : CalendarApp.EventColor.ORANGE);
+        created++;
+      } catch(err2) {
+        console.log('Skipped: ' + title + ' — ' + err2.message);
+      }
+    }
+  }
+  return created;
+}
+
+/************************************
+ * DELETE EVENTS FOR ONE COACH
+ ************************************/
+function deleteEventsForCoach(calendar, coachNumber) {
+  const today = stripTime(new Date());
+  const future = new Date(today);
+  future.setFullYear(future.getFullYear() + 5);
+  calendar.getEvents(today, future).forEach(e => {
+    const t = e.getTitle();
+    if (t.indexOf(String(coachNumber)) === 0 ||
+        t.indexOf('🔴 ' + String(coachNumber)) === 0) {
+      e.deleteEvent();
+      sleep(100);
+    }
+  });
+}
+
+/************************************
+ * BATCH SYNC — STEP 1 (START)
+ ************************************/
+function startCalendarSync() {
+  const ui    = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) { ui.alert('Sheet not found: ' + SHEET_NAME); return; }
+
+  CalendarApp.getCalendarsByName(CALENDAR_NAME).forEach(cal => {
+    cal.deleteCalendar();
+    sleep(2000);
+  });
+
+  sleep(3000);
+  CalendarApp.createCalendar(CALENDAR_NAME);
+  sleep(1000);
+
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('SYNC_START_ROW', '0');
+  props.setProperty('SYNC_TOTAL_CREATED', '0');
+
+  const result = runBatch();
+
+  if (result.done) {
+    props.deleteProperty('SYNC_START_ROW');
+    props.deleteProperty('SYNC_TOTAL_CREATED');
+    ui.alert('✅ Sync complete!\n\nAll ' + result.totalCreated + ' calendar events created.');
+  } else {
+    ui.alert(
+      '📅 Batch ' + result.batchNum + ' done!\n\n' +
+      'Coaches synced : ' + result.nextRow + ' of ' + result.totalRows + '\n' +
+      'Events created : ' + result.totalCreated + '\n\n' +
+      'Click "Continue Calendar Sync" for next batch.'
+    );
+  }
+}
+
+/************************************
+ * BATCH SYNC — CONTINUE
+ ************************************/
+function continueCalendarSync() {
+  const ui    = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+
+  if (!props.getProperty('SYNC_START_ROW')) {
+    ui.alert('⚠️ No sync in progress.\n\nClick "Start Calendar Sync (Step 1)" first.');
+    return;
+  }
+
+  const result = runBatch();
+
+  if (result.done) {
+    props.deleteProperty('SYNC_START_ROW');
+    props.deleteProperty('SYNC_TOTAL_CREATED');
+    ui.alert('✅ Sync complete!\n\nAll ' + result.totalCreated + ' calendar events created.');
+  } else {
+    ui.alert(
+      '📅 Batch ' + result.batchNum + ' done!\n\n' +
+      'Coaches synced : ' + result.nextRow + ' of ' + result.totalRows + '\n' +
+      'Events created : ' + result.totalCreated + '\n\n' +
+      'Click "Continue Calendar Sync" for next batch.'
+    );
+  }
+}
+
+/************************************
+ * RUN ONE BATCH (internal)
+ ************************************/
+function runBatch() {
+  const props    = PropertiesService.getScriptProperties();
+  const startRow = parseInt(props.getProperty('SYNC_START_ROW') || '0');
+  let   total    = parseInt(props.getProperty('SYNC_TOTAL_CREATED') || '0');
+
+  const sheet     = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const data      = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const calendar  = getOrCreateCalendar();
+  const today     = stripTime(new Date());
+  const validRows = data.filter(row => row[COL_COACH] && row[COL_POH]);
+  const totalRows = validRows.length;
+  const endRow    = Math.min(startRow + BATCH_SIZE, totalRows);
+  const batchNum  = Math.floor(startRow / BATCH_SIZE) + 1;
+
+  validRows.slice(startRow, endRow).forEach(row => {
+    const result = getDueDate(row);
+    if (!result) return;
+    total += createEventsForCoach(
+      calendar, row[COL_TRAIN], row[COL_COACH],
+      row[COL_TYPE], result.dueDate, result.dueType, today
+    );
+    sleep(500); // 500ms between each coach
+  });
+
+  props.setProperty('SYNC_START_ROW', String(endRow));
+  props.setProperty('SYNC_TOTAL_CREATED', String(total));
+
+  return { done: endRow >= totalRows, nextRow: endRow, totalRows, totalCreated: total, batchNum };
+}
+
+/************************************
+ * CHECK SYNC STATUS
+ ************************************/
+function checkSyncStatus() {
+  const props    = PropertiesService.getScriptProperties();
+  const startRow = props.getProperty('SYNC_START_ROW');
+  if (!startRow) { SpreadsheetApp.getUi().alert('No sync in progress or already complete.'); return; }
+
+  const sheet     = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const data      = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const validRows = data.filter(row => row[COL_COACH] && row[COL_POH]).length;
+  const created   = props.getProperty('SYNC_TOTAL_CREATED') || '0';
+
+  SpreadsheetApp.getUi().alert(
+    '📊 Sync Status\n\n' +
+    'Coaches synced : ' + startRow + ' of ' + validRows + '\n' +
+    'Events created : ' + created + '\n' +
+    'Remaining      : ' + (validRows - parseInt(startRow)) + ' coaches\n\n' +
+    'Click "Continue Calendar Sync" to resume.'
+  );
+}
+
+/************************************
+ * ON EDIT TRIGGER
+ ************************************/
+function onEditTrigger(e) {
+  const sheet = e.source.getActiveSheet();
+  if (sheet.getName() !== SHEET_NAME) return;
+
+  const row      = e.range.getRow();
+  const col      = e.range.getColumn();
+  const oldValue = e.oldValue || '';
+  const newValue = e.value    || '';
+  if (row < 2) return;
+
+  const rowData = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const coach   = rowData[COL_COACH];
+  const train   = rowData[COL_TRAIN];
+  const type    = rowData[COL_TYPE];
+
+  let changeType = 'Edited';
+  if      (!newValue && !coach)      changeType = 'Coach Deleted';
+  else if (!oldValue && coach)       changeType = 'Coach Added';
+  else if (col - 1 === COL_IOH)     changeType = 'IOH Date Filled';
+
+  writeToLog({
+    timestamp  : fmtDateTime(new Date()),
+    changeType : changeType,
+    trainNo    : train     || '',
+    coachNo    : coach     || '',
+    coachType  : type      || '',
+    column     : COL_HEADERS[col - 1] || 'Column ' + col,
+    oldValue   : oldValue,
+    newValue   : newValue,
+    editedBy   : Session.getActiveUser().getEmail(),
+    rowNo      : row
+  });
+
+  if (!coach || !rowData[COL_POH]) return;
+
+  try {
+    const calendar = getOrCreateCalendar();
+    const today    = stripTime(new Date());
+    deleteEventsForCoach(calendar, String(coach));
+    const result = getDueDate(rowData);
+    if (result) createEventsForCoach(calendar, train, coach, type, result.dueDate, result.dueType, today);
+  } catch (err) {
+    console.log('Calendar sync error: ' + err.message);
+  }
+}
+
+/************************************
+ * WRITE TO CHANGE LOG SHEET
+ ************************************/
+function writeToLog(entry) {
+  try {
+    if (!LOG_SHEET_URL) return;
+    const logSS    = SpreadsheetApp.openByUrl(LOG_SHEET_URL);
+    const logSheet = logSS.getSheets()[0];
+
+    if (logSheet.getLastRow() === 0) {
+      logSheet.appendRow(['Timestamp','Change Type','Train No','Coach Number',
+        'Coach Type','Column Changed','Old Value','New Value','Edited By','Row No']);
+      const h = logSheet.getRange(1,1,1,10);
+      h.setFontWeight('bold'); h.setBackground('#1F3864'); h.setFontColor('#FFFFFF');
+    }
+
+    logSheet.appendRow([entry.timestamp, entry.changeType, entry.trainNo, entry.coachNo,
+      entry.coachType, entry.column, entry.oldValue, entry.newValue, entry.editedBy, entry.rowNo]);
+  } catch (err) {
+    console.log('Log write error: ' + err.message);
+  }
+}
+
+/************************************
+ * SETUP TRIGGERS
+ ************************************/
+function setupOnEditTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'onEditTrigger')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('onEditTrigger')
+    .forSpreadsheet(SpreadsheetApp.getActive())
+    .onEdit()
+    .create();
+  SpreadsheetApp.getUi().alert('✅ Change tracking active!\nEvery edit will be logged and calendar auto-updated.');
+}
+
+function setupTrigger() {
+  removeTrigger();
+  ScriptApp.newTrigger('runDailyCheck')
+    .timeBased()
+    .everyDays(1)
+    .atHour(7)
+    .create();
+  SpreadsheetApp.getUi().alert('✅ Auto trigger set!\nSheet colours will update every morning at 7 AM.');
+}
+
+function removeTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runDailyCheck')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+}
