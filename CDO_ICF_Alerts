@@ -1,0 +1,395 @@
+/************************************
+ * CONFIG  —  edit only this section
+ ************************************/
+const SHEET_NAME    = 'ICF_PRO_UBL_2026';
+const CALENDAR_NAME = 'ICF_Due_Alerts';
+const LOG_TAB_NAME  = 'Change_Log';
+const BATCH_SIZE    = 15;
+
+// Srl | Train No | Coach Number | Coach Type | POH Date | IOH Date | Return Date | Sync Status
+//  0       1            2             3           4          5           6               7
+const COL_TRAIN  = 1;
+const COL_COACH  = 2;
+const COL_TYPE   = 3;
+const COL_POH    = 4;
+const COL_IOH    = 5;
+const COL_RETURN = 6;
+const COL_STATUS = 7;
+
+const REMINDER_START_DAYS = 10;
+const COL_HEADERS = ['Srl','Train No','Coach Number','Coach Type','POH Date','IOH Date','Return Date','Sync Status'];
+
+/************************************
+ * MENU — Just 2 items
+ ************************************/
+function onOpen() {
+  autoSetup();
+  SpreadsheetApp.getUi()
+    .createMenu('ICF Controls')
+    .addItem('🔍 Scan for Due', 'scanForDue')
+    .addItem('📅 Sync to Calendar', 'syncToCalendar')
+    .addToUi();
+}
+
+/************************************
+ * AUTO SETUP
+ * Runs once automatically on first
+ * open — sets up everything silently
+ ************************************/
+function autoSetup() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('SETUP_DONE') === 'true') return;
+
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  // 1. Status column
+  const h = sheet.getRange(1, COL_STATUS + 1);
+  if (!h.getValue()) {
+    h.setValue('Sync Status');
+    h.setFontWeight('bold'); h.setBackground('#1F3864');
+    h.setFontColor('#FFFFFF'); h.setFontSize(11);
+    h.setHorizontalAlignment('center');
+    sheet.setColumnWidth(COL_STATUS + 1, 140);
+    const lastRow = sheet.getLastRow();
+    for (let r = 2; r <= lastRow; r++) {
+      if (sheet.getRange(r, COL_COACH + 1).getValue()) setRowStatus(sheet, r, 'pending');
+    }
+  }
+
+  // 2. Daily scan trigger
+  if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'scanForDue')) {
+    ScriptApp.newTrigger('scanForDue').timeBased().everyDays(1).atHour(7).create();
+  }
+
+  // 3. onChange trigger (row deletion)
+  if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'onChangeTrigger')) {
+    ScriptApp.newTrigger('onChangeTrigger').forSpreadsheet(ss).onChange().create();
+    saveSnapshot();
+  }
+
+  // 4. onEdit trigger (cell edits)
+  if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'onEditTrigger')) {
+    ScriptApp.newTrigger('onEditTrigger').forSpreadsheet(ss).onEdit().create();
+  }
+
+  props.setProperty('SETUP_DONE', 'true');
+}
+
+/************************************
+ * 🔍 SCAN FOR DUE
+ * Fast — only reads sheet, no calendar
+ * Colours rows by urgency + summary
+ ************************************/
+function scanForDue() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) { SpreadsheetApp.getUi().alert('Sheet not found: ' + SHEET_NAME); return; }
+
+  const today   = stripTime(new Date());
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const numCols     = sheet.getLastColumn();
+  const range       = sheet.getRange(2, 1, lastRow - 1, numCols);
+  const data        = range.getValues();
+  const backgrounds = [];
+  let   overdue = 0, urgent = 0, upcoming = 0;
+
+  data.forEach(row => {
+    const result = getDueDate(row);
+    let color = '#ffffff';
+    if (result) {
+      const days = daysBetween(today, result.dueDate);
+      if      (days <= 0)  { color = '#c62828'; overdue++;  }
+      else if (days <= 7)  { color = '#ef6c00'; urgent++;   }
+      else if (days <= 30) { color = '#FFD600'; upcoming++; }
+    }
+    backgrounds.push(new Array(numCols).fill(color));
+  });
+
+  range.setBackgrounds(backgrounds);
+
+  let msg = '🔍 Scan Complete!\n\n';
+  if (overdue  > 0) msg += '🔴 Overdue       : ' + overdue  + ' coaches\n';
+  if (urgent   > 0) msg += '🟠 Due ≤ 7 days  : ' + urgent   + ' coaches\n';
+  if (upcoming > 0) msg += '🟡 Due ≤ 30 days : ' + upcoming + ' coaches\n';
+  if (!overdue && !urgent && !upcoming) msg += '✅ No coaches due within 30 days!';
+
+  SpreadsheetApp.getUi().alert(msg);
+}
+
+/************************************
+ * 📅 SYNC TO CALENDAR
+ * Select rows → syncs those rows
+ * No selection → syncs first 15
+ * unsynced rows automatically
+ ************************************/
+function syncToCalendar() {
+  const ui    = SpreadsheetApp.getUi();
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) { ui.alert('Sheet not found: ' + SHEET_NAME); return; }
+
+  const calendar  = getOrCreateCalendar();
+  const today     = stripTime(new Date());
+  const selection = sheet.getActiveRange();
+  const firstRow  = selection.getRow();
+  const numRows   = selection.getNumRows();
+  let   rowsToSync = [];
+
+  if (ss.getActiveSheet().getName() === SHEET_NAME && firstRow >= 2 && numRows >= 1) {
+    // Use selected rows (max 15)
+    for (let r = firstRow; r < firstRow + Math.min(numRows, BATCH_SIZE); r++) {
+      rowsToSync.push(r);
+    }
+  } else {
+    // Auto: find first 15 unsynced rows
+    const lastRow = sheet.getLastRow();
+    for (let r = 2; r <= lastRow && rowsToSync.length < BATCH_SIZE; r++) {
+      const status = sheet.getRange(r, COL_STATUS + 1).getValue();
+      if (status !== '✅ Synced') rowsToSync.push(r);
+    }
+  }
+
+  if (!rowsToSync.length) { ui.alert('✅ All coaches are already synced!'); return; }
+
+  let created = 0, skipped = 0, processed = 0;
+
+  rowsToSync.forEach(r => {
+    const row   = sheet.getRange(r, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const coach = row[COL_COACH];
+    if (!coach || !row[COL_POH]) { skipped++; setRowStatus(sheet, r, 'unsynced'); return; }
+    const result = getDueDate(row);
+    if (!result) { skipped++; setRowStatus(sheet, r, 'unsynced'); return; }
+    deleteEventsForCoach(calendar, String(coach));
+    created += createEventsForCoach(calendar, row[COL_TRAIN], coach, row[COL_TYPE], result.dueDate, result.dueType, today);
+    setRowStatus(sheet, r, 'synced');
+    processed++;
+    sleep(500);
+  });
+
+  let msg = '✅ Sync Done!\n\n' +
+    'Coaches synced : ' + processed + '\n' +
+    'Events created : ' + created;
+  if (skipped > 0) msg += '\nSkipped (empty): ' + skipped;
+  ui.alert(msg);
+}
+
+/************************************
+ * DATE HELPERS
+ ************************************/
+function stripTime(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function addMonths(date, months) {
+  const d = new Date(date);
+  const day = d.getDate();
+  d.setMonth(d.getMonth() + months);
+  if (d.getDate() < day) d.setDate(0);
+  return stripTime(d);
+}
+
+function daysBetween(a, b) {
+  return Math.floor((stripTime(b) - stripTime(a)) / (1000 * 60 * 60 * 24));
+}
+
+function fmtDate(d) {
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM/yyyy');
+}
+
+function fmtDateTime(d) {
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm:ss');
+}
+
+function sleep(ms) { Utilities.sleep(ms); }
+
+/************************************
+ * STATUS COLUMN HELPER
+ ************************************/
+function setRowStatus(sheet, rowNum, status) {
+  try {
+    const cell = sheet.getRange(rowNum, COL_STATUS + 1);
+    if      (status === 'synced')   { cell.setValue('✅ Synced');        cell.setBackground('#E8F5E9'); cell.setFontColor('#2E7D32'); }
+    else if (status === 'unsynced') { cell.setValue('❌ Not Synced');   cell.setBackground('#FFEBEE'); cell.setFontColor('#C62828'); }
+    else if (status === 'pending')  { cell.setValue('🔄 Pending Sync'); cell.setBackground('#FFF8E1'); cell.setFontColor('#F57F17'); }
+    cell.setFontWeight('bold'); cell.setHorizontalAlignment('center');
+  } catch(err) { console.log('Status error: ' + err.message); }
+}
+
+/************************************
+ * CALENDAR HELPER
+ ************************************/
+function getOrCreateCalendar() {
+  const cals = CalendarApp.getCalendarsByName(CALENDAR_NAME);
+  return cals.length ? cals[0] : CalendarApp.createCalendar(CALENDAR_NAME);
+}
+
+/************************************
+ * GET OR CREATE CHANGE LOG TAB
+ ************************************/
+function getOrCreateLogSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let log  = ss.getSheetByName(LOG_TAB_NAME);
+  if (!log) {
+    log = ss.insertSheet(LOG_TAB_NAME);
+    log.appendRow(['Timestamp','Change Type','Train No','Coach Number',
+      'Coach Type','Column Changed','Old Value','New Value','Edited By','Row No']);
+    const h = log.getRange(1,1,1,10);
+    h.setFontWeight('bold'); h.setBackground('#1F3864');
+    h.setFontColor('#FFFFFF'); h.setFontSize(11);
+    [160,130,100,130,110,140,120,120,200,70].forEach((w,i) => log.setColumnWidth(i+1,w));
+    log.setFrozenRows(1);
+  }
+  return log;
+}
+
+/************************************
+ * COMPUTE DUE DATE FOR A ROW
+ * — IOH Date empty  → IOH = POH + 9m
+ * — IOH Date filled → POH = IOH + 9m
+ * — Return Date → overrides POH due
+ ************************************/
+function getDueDate(row) {
+  const pohDate    = row[COL_POH]    instanceof Date ? stripTime(row[COL_POH])    : null;
+  const iohDone    = row[COL_IOH]    instanceof Date ? stripTime(row[COL_IOH])    : null;
+  const returnDate = row[COL_RETURN] instanceof Date ? stripTime(row[COL_RETURN]) : null;
+  if (!pohDate) return null;
+  if (!iohDone) return { dueDate: addMonths(pohDate, 9), dueType: 'IOH' };
+  return { dueDate: returnDate ? returnDate : addMonths(iohDone, 9), dueType: 'POH' };
+}
+
+/************************************
+ * CREATE EVENTS FOR ONE COACH
+ ************************************/
+function createEventsForCoach(calendar, train, coach, type, dueDate, dueType, today) {
+  let created = 0;
+  for (let d = REMINDER_START_DAYS; d >= 0; d--) {
+    const eventDate = new Date(dueDate);
+    eventDate.setDate(eventDate.getDate() - d);
+    if (eventDate < today) continue;
+    const title = d === 0
+      ? '🔴 ' + coach + ' ' + dueType + ' DUE TODAY'
+      : coach + ' ' + dueType + ' due in ' + d + ' day' + (d > 1 ? 's' : '');
+    const desc =
+      'Train No     : ' + train + '\n' +
+      'Coach Number : ' + coach + '\n' +
+      'Coach Type   : ' + type  + '\n' +
+      dueType + ' Due      : ' + fmtDate(dueDate) + '\n' +
+      'Days Left    : ' + d;
+    const start = new Date(eventDate); start.setHours(9,0,0,0);
+    const end   = new Date(start.getTime() + 15 * 60 * 1000);
+    try {
+      const ev = calendar.createEvent(title, start, end, { description: desc });
+      ev.setColor(d === 0 ? CalendarApp.EventColor.RED : CalendarApp.EventColor.ORANGE);
+      created++; sleep(200);
+    } catch(err) {
+      sleep(2000);
+      try {
+        const ev = calendar.createEvent(title, start, end, { description: desc });
+        ev.setColor(d === 0 ? CalendarApp.EventColor.RED : CalendarApp.EventColor.ORANGE);
+        created++;
+      } catch(e2) { console.log('Skipped: ' + title); }
+    }
+  }
+  return created;
+}
+
+/************************************
+ * DELETE EVENTS FOR ONE COACH
+ ************************************/
+function deleteEventsForCoach(calendar, coachNumber) {
+  const today  = stripTime(new Date());
+  const future = new Date(today); future.setFullYear(future.getFullYear() + 5);
+  calendar.getEvents(today, future).forEach(e => {
+    const t = e.getTitle();
+    if (t.indexOf(String(coachNumber)) === 0 || t.indexOf('🔴 ' + String(coachNumber)) === 0) {
+      e.deleteEvent(); sleep(100);
+    }
+  });
+}
+
+/************************************
+ * ON EDIT TRIGGER (auto background)
+ * Logs every edit + auto-syncs
+ * only the edited coach row
+ ************************************/
+function onEditTrigger(e) {
+  const sheet = e.source.getActiveSheet();
+  if (sheet.getName() !== SHEET_NAME) return;
+  const row = e.range.getRow(), col = e.range.getColumn();
+  const oldValue = e.oldValue || '', newValue = e.value || '';
+  if (row < 2 || col === COL_STATUS + 1) return;
+
+  const rowData = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const coach = rowData[COL_COACH], train = rowData[COL_TRAIN], type = rowData[COL_TYPE];
+
+  let changeType = 'Edited';
+  if      (!newValue && !coach)  changeType = 'Coach Deleted';
+  else if (!oldValue && coach)   changeType = 'Coach Added';
+  else if (col - 1 === COL_IOH) changeType = 'IOH Date Filled';
+
+  writeToLog({ timestamp: fmtDateTime(new Date()), changeType,
+    trainNo: train||'', coachNo: coach||'', coachType: type||'',
+    column: COL_HEADERS[col-1]||'Col '+col, oldValue, newValue,
+    editedBy: Session.getActiveUser().getEmail(), rowNo: row });
+
+  if (!coach || !rowData[COL_POH]) { setRowStatus(sheet, row, 'pending'); return; }
+  setRowStatus(sheet, row, 'pending');
+  try {
+    const cal = getOrCreateCalendar(), today = stripTime(new Date());
+    deleteEventsForCoach(cal, String(coach));
+    const result = getDueDate(rowData);
+    if (result) { createEventsForCoach(cal, train, coach, type, result.dueDate, result.dueType, today); setRowStatus(sheet, row, 'synced'); }
+    else        { setRowStatus(sheet, row, 'unsynced'); }
+  } catch(err) { setRowStatus(sheet, row, 'pending'); }
+}
+
+/************************************
+ * ON CHANGE TRIGGER (row deletion)
+ * Detects deleted rows and removes
+ * their calendar events automatically
+ ************************************/
+function onChangeTrigger(e) {
+  if (e.changeType !== 'REMOVE_ROW') return;
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+  const current  = new Set(sheet.getRange(2,1,sheet.getLastRow()-1,sheet.getLastColumn())
+                    .getValues().map(r => String(r[COL_COACH])).filter(c => c && c !== ''));
+  const props    = PropertiesService.getScriptProperties();
+  const snapshot = JSON.parse(props.getProperty('COACH_SNAPSHOT') || '[]');
+  const deleted  = snapshot.filter(c => !current.has(c));
+  if (!deleted.length) { saveSnapshot(); return; }
+  const cal = getOrCreateCalendar();
+  deleted.forEach(coach => {
+    try {
+      deleteEventsForCoach(cal, coach);
+      writeToLog({ timestamp: fmtDateTime(new Date()), changeType: 'Coach Deleted',
+        trainNo:'', coachNo: coach, coachType:'', column:'Row Deleted',
+        oldValue: coach, newValue:'', editedBy: Session.getActiveUser().getEmail(), rowNo:'' });
+    } catch(err) { console.log('Unsync error: ' + err.message); }
+  });
+  saveSnapshot();
+}
+
+/************************************
+ * SAVE COACH SNAPSHOT
+ ************************************/
+function saveSnapshot() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+  const coaches = sheet.getRange(2,1,sheet.getLastRow()-1,sheet.getLastColumn())
+    .getValues().map(r => String(r[COL_COACH])).filter(c => c && c !== '');
+  PropertiesService.getScriptProperties().setProperty('COACH_SNAPSHOT', JSON.stringify(coaches));
+}
+
+/************************************
+ * WRITE TO CHANGE_LOG TAB
+ ************************************/
+function writeToLog(entry) {
+  try {
+    getOrCreateLogSheet().appendRow([entry.timestamp, entry.changeType, entry.trainNo, entry.coachNo,
+      entry.coachType, entry.column, entry.oldValue, entry.newValue, entry.editedBy, entry.rowNo]);
+  } catch(err) { console.log('Log error: ' + err.message); }
+}
